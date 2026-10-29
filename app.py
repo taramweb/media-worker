@@ -1,5 +1,5 @@
 """
-Worker média pour Ask Tariq / CONFOWEB
+Worker média / by TaRaM / CONFOWEB
 voix (audio)  ->  transcription mot par mot  ->  sous-titres animés  ->  short vertical 1080x1920
 
 Routes :
@@ -138,12 +138,12 @@ ASS_HEADER = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
-WrapStyle: 0
+WrapStyle: 2
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Sub,DejaVu Sans,78,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,470,1
+Style: Sub,DejaVu Sans,72,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,5,60,60,0,1
 Style: Title,DejaVu Sans,88,&H0000E6FF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,8,70,70,230,1
 
 [Events]
@@ -166,7 +166,7 @@ def clean_token(token: str, upper: bool) -> str:
     return token.upper() if upper else token
 
 
-def chunk_words(words, max_words=3, max_chars=18, max_gap=0.6):
+def chunk_words(words, max_words=3, max_chars=16, max_gap=0.6):
     chunks, cur = [], []
     for w in words:
         if cur:
@@ -184,7 +184,17 @@ def chunk_words(words, max_words=3, max_chars=18, max_gap=0.6):
     return chunks
 
 
-def build_ass(words, title: str, upper: bool, duration: float) -> str:
+def fit_font_size(tokens, base_size: int, upper: bool, max_width: int = 960) -> int:
+    """Estime la largeur du texte et réduit la taille pour qu'il tienne sur une seule ligne."""
+    factor = 0.74 if upper else 0.64
+    width = (sum(len(t) for t in tokens) + 0.5 * (len(tokens) - 1)) * factor * base_size
+    if width <= max_width:
+        return base_size
+    return max(40, int(base_size * max_width / width))
+
+
+def build_ass(words, title: str, upper: bool, duration: float,
+              font_size: int = 72, sub_y: int = 1450, max_words: int = 3) -> str:
     lines = [ASS_HEADER]
     if title.strip():
         end = min(3.5, duration)
@@ -192,17 +202,28 @@ def build_ass(words, title: str, upper: bool, duration: float) -> str:
         lines.append(
             f"Dialogue: 1,{ass_time(0)},{ass_time(end)},Title,,0,0,0,,{{\\fad(150,200)}}{text}\n"
         )
-    for chunk in chunk_words(words):
+    chunks = chunk_words(words, max_words=max_words)
+    for ci, chunk in enumerate(chunks):
+        next_start = chunks[ci + 1][0]["start"] if ci + 1 < len(chunks) else None
         tokens = [clean_token(w["w"], upper) for w in chunk]
+        fs = fit_font_size(tokens, font_size, upper)
+        # \an5 + \pos : le centre du texte reste EXACTEMENT au même endroit pour tous les mots
+        prefix = f"{{\\an5\\pos(540,{sub_y})\\fs{fs}}}"
         for i, w in enumerate(chunk):
             start = w["start"]
-            end = chunk[i + 1]["start"] if i + 1 < len(chunk) else w["end"] + 0.15
+            if i + 1 < len(chunk):
+                end = chunk[i + 1]["start"]
+            else:
+                end = w["end"] + 0.15
+                if next_start is not None:      # jamais de chevauchement avec le groupe suivant
+                    end = min(end, next_start)
+            end = max(end, start + 0.05)
             parts = [
                 f"{HIGHLIGHT}{tok}{NORMAL}" if j == i else tok
                 for j, tok in enumerate(tokens)
             ]
             lines.append(
-                f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Sub,,0,0,0,,{' '.join(parts)}\n"
+                f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Sub,,0,0,0,,{prefix}{' '.join(parts)}\n"
             )
     return "".join(lines)
 
@@ -265,6 +286,9 @@ def render(
     initial_prompt: str = Form(""),      # noms et termes à reconnaître (Starlink, SpaceX...)
     uppercase: bool = Form(True),
     words_json: str = Form(""),          # optionnel : mots déjà transcrits (saute Whisper)
+    font_size: int = Form(72),           # taille des sous-titres (réduite auto si trop large)
+    sub_y: int = Form(1450),             # hauteur fixe des sous-titres (0 = haut, 1920 = bas)
+    max_words: int = Form(3),            # mots affichés en même temps
 ):
     job = JOBS / uuid.uuid4().hex
     job.mkdir(parents=True)
@@ -281,7 +305,7 @@ def render(
             if not words:
                 raise HTTPException(status_code=422, detail="Aucune parole détectée")
 
-            (job / "subs.ass").write_text(build_ass(words, title, uppercase, duration), encoding="utf-8")
+            (job / "subs.ass").write_text(build_ass(words, title, uppercase, duration, font_size, sub_y, max_words), encoding="utf-8")
 
             bg = pick_asset("backgrounds", background, VIDEO_EXT | IMAGE_EXT, "random")
             mus = pick_asset("music", music, MUSIC_EXT, "none")
