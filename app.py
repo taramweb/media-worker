@@ -171,6 +171,11 @@ HIGHLIGHT = r"{\c&H00E6FF&}"   # jaune (BBGGRR)
 NORMAL = r"{\c&HFFFFFF&}"      # blanc
 
 
+def shade(tag: str, k: int) -> str:
+    """Variante quasi identique d'une couleur (k=0 ou 1) pour empêcher la fusion de blocs."""
+    return tag if k == 0 else tag.replace("&}", "&}").replace("&H00E6FF&", "&H00E6FE&").replace("&HFFFFFF&", "&HFEFEFE&")
+
+
 def ass_time(t: float) -> str:
     cs = max(0, int(round(t * 100)))
     h, rem = divmod(cs, 360000)
@@ -240,25 +245,27 @@ def build_ass(words, title: str, upper: bool, duration: float,
                     end = min(end, next_start)
             end = max(end, start + 0.05)
             if rtl:
-                # libass casse l'ordre de lecture arabe dès qu'une couleur change au milieu
-                # d'une ligne. Parade (vérifiée) : un bloc par mot, écrits dans l'ordre
-                # VISUEL (de gauche à droite), donc du dernier mot au premier.
-                # La ponctuation (:  ،  ؟  «») forme son propre bloc : dans l'ordre visuel
-                # elle se place à GAUCHE du mot (fin de phrase en arabe) ou à droite si
-                # c'est un signe ouvrant.
-                parts = []
+                # libass lit chaque bloc de couleur identique d'un seul tenant (droite -> gauche)
+                # et pose les blocs distincts de gauche à droite, dans l'ordre d'écriture.
+                # Pour garantir l'ordre arabe : chaque mot, chaque signe de ponctuation et
+                # chaque espace forme SON bloc, écrit dans l'ordre VISUEL (dernier mot d'abord).
+                # Deux blocs voisins ne partagent jamais la même valeur de couleur
+                # (nuances alternées, invisibles à l'œil), sinon libass les fusionne.
+                runs = []
                 for j in range(len(tokens) - 1, -1, -1):
-                    col = HIGHLIGHT if j == i else NORMAL
+                    base = HIGHLIGHT if j == i else NORMAL
                     m = re.match(r"^(\W*)(.*?)(\W*)$", tokens[j], re.S)
                     lead, core, trail = m.group(1), m.group(2), m.group(3)
-                    seg = ""
-                    if trail:
-                        seg += f"{col}{trail}"
-                    seg += f"{col}{{\\fsp0}}{core}" if (trail or lead) else f"{col}{core}"
-                    if lead:
-                        seg += f"{col}{{\\fsp0}}{lead}"
-                    parts.append(seg)
-                body = f"{NORMAL} ".join(parts)
+                    if trail:                      # fin de mot -> s'affiche à GAUCHE du mot
+                        runs.append((base, trail))
+                    runs.append((base, core or tokens[j]))
+                    if lead:                       # début de mot -> s'affiche à DROITE du mot
+                        runs.append((base, lead))
+                    if j > 0:
+                        runs.append((NORMAL, " "))
+                body = ""
+                for k, (base, text) in enumerate(runs):
+                    body += shade(base, k % 2) + text
             else:
                 body = " ".join(
                     f"{HIGHLIGHT}{tok}{NORMAL}" if j == i else tok
@@ -609,6 +616,7 @@ def render_story(
     preset: str = Form("medium"),
     denoise: bool = Form(True),
     show_title: bool = Form(True),
+    max_mb: float = Form(45.0),             # taille maximale visée (limite des bots Telegram : 50 Mo)
 ):
     script = parse_script(script_json)
     shots = script["shots"]
@@ -691,9 +699,11 @@ def render_story(
             else:
                 agraph = f"[{vi}:a]{voice_chain},afade=t=out:st={total - 1.0:.2f}:d=1.0,{loud}[a]"
 
+            # débit vidéo plafonné pour que le fichier reste sous max_mb (audio 192 kb/s inclus)
+            vkbps = int(max(800, min(12000, max_mb * 8192 / total - 200)))
             cmd += ["-filter_complex", f"{vgraph};{agraph}", "-map", "[v]", "-map", "[a]",
                     "-t", f"{total:.2f}", "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-                    "-maxrate", "10M", "-bufsize", "20M", "-profile:v", "high", "-r", str(FPS),
+                    "-maxrate", f"{vkbps}k", "-bufsize", f"{2 * vkbps}k", "-profile:v", "high", "-r", str(FPS),
                     "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
                     "-movflags", "+faststart", "story.mp4"]
             res = subprocess.run(cmd, cwd=job, capture_output=True, text=True, timeout=1800)
