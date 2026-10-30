@@ -509,12 +509,24 @@ def compute_timing(voice: Path, duration: float, script: dict, language: str,
         heard = json.loads(words_json)
         heard = heard["words"] if isinstance(heard, dict) else heard
     else:
-        prompt = " ".join(display_token(w) for s in script["shots"] for w in s["text"].split())[:300]
-        heard = transcribe_file(voice, language, prompt)["words"]
+        heard = transcribe_file(voice, language, "")["words"]
     toks, ratio = align_script(script, heard, duration)
     total = duration + 0.6
+    fallback = ratio < 0.5
+    if fallback:
+        # Correspondance trop faible : on répartit les mots sur la période où la voix
+        # parle réellement, au prorata du nombre de lettres de chaque mot.
+        t0 = heard[0]["start"] if isinstance(heard[0], dict) else 0.0
+        t1 = max(h["end"] for h in heard)
+        weights = [len(t["n"]) + 1 for t in toks]
+        cum, tot = 0, float(sum(weights))
+        for t, wgt in zip(toks, weights):
+            t["start"] = round(t0 + (t1 - t0) * cum / tot, 3)
+            cum += wgt
+            t["end"] = round(t0 + (t1 - t0) * cum / tot, 3)
     starts = shot_starts(toks, len(script["shots"]), lead)
-    return {"toks": toks, "ratio": ratio, "starts": starts, "total": total, "duration": duration}
+    return {"toks": toks, "ratio": ratio, "starts": starts, "total": total,
+            "duration": duration, "fallback": fallback}
 
 
 def ken_burns_clip(img: Path, out: Path, seconds: float, motion: str, strength: float):
@@ -570,8 +582,9 @@ def align(
             shots.append({"shot": i + 1, "start": round(starts[i], 2), "end": round(end, 2),
                           "seconds": round(end - starts[i], 2), "motion": s["motion"], "text": s["text"]})
         return {"audio_seconds": round(duration, 2), "match_ratio": round(t["ratio"], 3),
-                "warning": "Faible correspondance : parle plus proche du script ou essaie WHISPER_MODEL=medium"
-                if t["ratio"] < 0.6 else None, "shots": shots}
+                "fallback_proportional": t["fallback"],
+                "warning": "Faible correspondance : minutage réparti au prorata du texte. Relis le script tel quel ou essaie WHISPER_MODEL=medium"
+                if t["fallback"] else None, "shots": shots}
     finally:
         shutil.rmtree(job, ignore_errors=True)
 
