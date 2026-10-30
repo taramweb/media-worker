@@ -8,6 +8,8 @@ Routes :
   POST /assets/{kind}      envoie un fichier dans backgrounds | music | fonts
   POST /transcribe         audio -> JSON (texte + mots horodatés)
   POST /render             audio -> vidéo MP4 sous-titrée (fond unique)
+  POST /scripts/{job_id}   enregistre le script d'un job (JSON)
+  GET  /scripts/{job_id}   relit le script d'un job
   POST /align              audio + script -> minutage de chaque plan (diagnostic)
   POST /render_story       audio + script + images -> histoire montée (Ken Burns,
                            fondus, sous-titres arabes, musique avec ducking)
@@ -28,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import List
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
@@ -39,7 +41,8 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 ASSETS = DATA_DIR / "assets"
 JOBS = DATA_DIR / "jobs"
 MODELS = DATA_DIR / "models"
-for _p in (ASSETS / "backgrounds", ASSETS / "music", ASSETS / "fonts", JOBS, MODELS):
+SCRIPTS = DATA_DIR / "scripts"
+for _p in (ASSETS / "backgrounds", ASSETS / "music", ASSETS / "fonts", JOBS, MODELS, SCRIPTS):
     _p.mkdir(parents=True, exist_ok=True)
 
 API_KEY = os.getenv("API_KEY", "")
@@ -54,7 +57,7 @@ VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 MUSIC_EXT = {".mp3", ".wav", ".m4a", ".ogg", ".aac"}
 
-app = FastAPI(title="Media worker", version="1.1")
+app = FastAPI(title="Media worker", version="1.2")
 
 # Un seul travail lourd à la fois : protège la RAM du VPS partagé.
 WORK = threading.Semaphore(1)
@@ -288,6 +291,39 @@ def health():
         "whisper_model": WHISPER_MODEL,
         "auth": bool(API_KEY),
     }
+
+
+# --------------------------------------------------------------------------
+# Mémoire des scripts : garde le script d'un job entre deux messages Telegram
+# --------------------------------------------------------------------------
+_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
+
+
+def script_path(job_id: str) -> Path:
+    if not _JOB_ID.match(job_id):
+        raise HTTPException(status_code=400, detail="job_id invalide (4 à 40 caractères : lettres, chiffres, _ -)")
+    return SCRIPTS / f"{job_id}.json"
+
+
+@app.post("/scripts/{job_id}", dependencies=[Depends(check_key)])
+def save_script(job_id: str, payload: dict = Body(...)):
+    path = script_path(job_id)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    # ménage : on garde 60 jours
+    import time
+    limit = time.time() - 60 * 86400
+    for old in SCRIPTS.glob("*.json"):
+        if old.stat().st_mtime < limit:
+            old.unlink(missing_ok=True)
+    return {"saved": job_id}
+
+
+@app.get("/scripts/{job_id}", dependencies=[Depends(check_key)])
+def load_script(job_id: str):
+    path = script_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Aucun script pour {job_id}")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @app.get("/assets", dependencies=[Depends(check_key)])
